@@ -698,6 +698,7 @@ except Exception as exc:
     st.error(f"Could not process PayPal redirect: {exc}")
 
 
+
 # ============================================================
 # NAVIGATION
 # ============================================================
@@ -711,14 +712,42 @@ PAGES = [
     "Activity",
 ]
 
+if "navigation" not in st.session_state:
+    st.session_state.navigation = "Overview"
+
+if "navigation_target" not in st.session_state:
+    st.session_state.navigation_target = None
+
+
+def apply_navigation():
+    target = st.session_state.navigation_target
+
+    if target in PAGES:
+        st.session_state.navigation = target
+
+    st.session_state.navigation_target = None
+
+
 with st.sidebar:
     st.markdown("# 💸 PayPilot")
     st.caption("YOUR AI MONEY AGENT")
     st.divider()
 
-    st.radio("WORKSPACE", PAGES, key="navigation")
+    # Apply navigation changes before rendering the radio widget.
+    if st.session_state.navigation_target in PAGES:
+        st.session_state.navigation = (
+            st.session_state.navigation_target
+        )
+        st.session_state.navigation_target = None
+
+    st.radio(
+        "WORKSPACE",
+        PAGES,
+        key="navigation",
+    )
 
     st.divider()
+
     st.caption(
         f"Groq AI: {'Configured' if GROQ_API_KEY else 'Not configured'}"
     )
@@ -727,7 +756,6 @@ with st.sidebar:
     st.caption("Budget data: Current session only")
 
 page = st.session_state.navigation
-
 
 # ============================================================
 # HEADER
