@@ -122,7 +122,7 @@ def make_payment_plan(text):
                     "purpose (string). Never execute payments. Never invent "
                     "missing details. The amount must be positive. If the "
                     "request is ambiguous, explain that details are missing "
-"                    "rather than making up an amount or recipient."
+"                   "rather than making up an amount or recipient."
                 ),
             },
             {"role": "user", "content": text},
