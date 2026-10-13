@@ -687,11 +687,18 @@ PAGES = [
     "Activity",
 ]
 
+if st.session_state.get("navigation_target"):
+    st.session_state["navigation"] = (
+        st.session_state.pop("navigation_target")
+    )
+        
 with st.sidebar:
     st.markdown("# 💸 PayPilot")
     st.caption("YOUR AI MONEY AGENT")
     st.divider()
 
+    )
+    
     st.radio(
         "WORKSPACE",
         PAGES,
@@ -879,7 +886,7 @@ elif page == "AI Assistant":
                 st.session_state.returned_order_id = None
                 st.session_state.order_already_completed = False
 
-                st.session_state.navigation = "PayPal Checkout"
+                st.session_state.navigation_target = "PayPal Checkout"
                 st.rerun()
 
             except Exception as exc:
