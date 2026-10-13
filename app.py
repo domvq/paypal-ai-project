@@ -532,6 +532,7 @@ with st.sidebar:
         "WORKSPACE",
         PAGES,
         key="navigation",
+        on_change=lambda: None,
     )
 
     st.divider()
