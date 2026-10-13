@@ -10,6 +10,10 @@ import requests
 import streamlit as st
 from groq import Groq
 
+from PIL import Image
+import pytesseract
+import io
+
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -113,6 +117,34 @@ for key, value in DEFAULTS.items():
 # ============================================================
 # HELPERS
 # ============================================================
+
+def extract_recipient_from_image(image_bytes):
+    """Extract visible text from a recipient's photo."""
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # OCR extracts text visible in the image.
+        extracted_text = pytesseract.image_to_string(image)
+
+        if not extracted_text.strip():
+            raise ValueError(
+                "No readable text found. Try a clearer picture."
+            )
+
+        return extracted_text.strip()
+
+    except pytesseract.TesseractNotFoundError as exc:
+        raise RuntimeError(
+            "Tesseract OCR is not installed or is not on your PATH."
+        ) from exc
+
+    except Exception as exc:
+        if isinstance(exc, ValueError):
+            raise
+
+        raise RuntimeError(
+            "Could not process the image. Please try another picture."
+        ) from exc
 
 def money(value):
     """Format a number as USD."""
@@ -822,12 +854,91 @@ elif page == "AI Assistant":
         "Describe a proposed payment. Review the extracted details "
         "before creating a PayPal checkout."
     )
+    st.markdown("### 📸 Scan recipient details")
+
+    st.write(
+        "Take a picture of a business card, invoice, or payment "
+        "request to extract visible text."
+    )
+
+    camera_image = st.camera_input(
+        "Take a picture of recipient details",
+        key="recipient_camera",
+    )
+
+    uploaded_image = st.file_uploader(
+        "Or upload an image",
+        type=["png", "jpg", "jpeg"],
+        key="recipient_upload",
+    )
+
+    image_source = uploaded_image or camera_image
+
+    if image_source is not None:
+        st.image(
+            image_source,
+            caption="Image selected for scanning",
+            use_container_width=True,
+        )
+
+        if st.button(
+            "🔍 Extract recipient details",
+            type="primary",
+            key="scan_recipient",
+        ):
+            try:
+                with st.spinner("Reading image..."):
+                    extracted_text = extract_recipient_from_image(
+                        image_source.getvalue()
+                    )
+
+                st.session_state["scanned_recipient_text"] = (
+                    extracted_text
+                )
+
+                st.success("Text extracted successfully.")
+
+            except Exception as exc:
+                st.error(f"Image scanning failed: {exc}")
+
+    scanned_text = st.session_state.get(
+        "scanned_recipient_text", ""
+    )
+
+    if scanned_text:
+        st.markdown("#### Review extracted text")
+
+        st.text_area(
+            "Text detected in image",
+            value=scanned_text,
+            height=150,
+            disabled=True,
+        )
+
+        if st.button(
+            "Use extracted text in payment planner",
+            key="use_scanned_text",
+        ):
+            st.session_state["payment_request_prefill"] = (
+                "Extracted recipient information from an image:\n"
+                + scanned_text
+                + "\n\nPrepare a payment plan only using details "
+                "I explicitly confirm. Ask me for any missing "
+                "recipient, amount, or purpose."
+            )
+            st.rerun()
 
     with st.form("payment_form"):
-        request_text = st.text_area(
+                request_text = st.text_area(
             "Describe your payment",
-            placeholder="Prepare a $35 checkout for a design consultation",
+            placeholder=(
+                "Prepare a $35 checkout for a design consultation"
+            ),
             max_chars=2000,
+            key="payment_request_input",
+            value=st.session_state.get(
+                "payment_request_prefill", ""
+            ),
         )
 
         submit_plan = st.form_submit_button(
