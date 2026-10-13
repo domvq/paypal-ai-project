@@ -7,3 +7,4 @@ groq
 requests
 Pillow
 pytesseract
+"Install Tesseract OCR for image scanning"
