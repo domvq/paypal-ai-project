@@ -697,7 +697,6 @@ with st.sidebar:
     st.caption("YOUR AI MONEY AGENT")
     st.divider()
 
-    )
     
     st.radio(
         "WORKSPACE",
