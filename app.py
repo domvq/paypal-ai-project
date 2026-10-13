@@ -806,8 +806,9 @@ if page == "Overview":
         st.markdown("#### 🤖 AI Assistant")
         st.write("Create a payment plan or scan recipient details.")
         if st.button("Open AI Assistant", type="primary"):
-            st.session_state.navigation = "AI Assistant"
+            st.session_state.navigation_target = "AI Assistant"
             st.rerun()
+         
 
     with c2:
         st.markdown("#### 💰 Budget & Lists")
@@ -1001,7 +1002,7 @@ elif page == "AI Assistant":
                     st.session_state.order_verified = False
                     st.session_state.returned_order_id = None
                     st.session_state.order_already_completed = False
-                    st.session_state.navigation = "PayPal Checkout"
+                    st.session_state.navigation_target = "PayPal Checkout"
                     st.rerun()
 
                 except Exception as exc:
