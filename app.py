@@ -1,4 +1,5 @@
 
+import copy
 import json
 import os
 import uuid
@@ -11,7 +12,7 @@ from groq import Groq
 
 
 # ============================================================
-# PAYPILOT — YOUR AI MONEY AGENT
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -27,26 +28,36 @@ st.set_page_config(
 # ============================================================
 
 def get_secret(name, default=""):
+    """Read a Streamlit secret, falling back to an environment variable."""
     try:
         value = st.secrets.get(name, default)
-        return value if value else os.getenv(name, default)
+        if value:
+            return str(value)
     except Exception:
-        return os.getenv(name, default)
+        pass
+
+    return os.getenv(name, default)
 
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
-GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = get_secret(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile",
+)
 
 PAYPAL_CLIENT_ID = get_secret("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = get_secret("PAYPAL_CLIENT_SECRET")
 PAYPAL_MODE = get_secret("PAYPAL_MODE", "sandbox").lower()
-APP_URL = get_secret("APP_URL", "http://localhost:8501").rstrip("/")
+APP_URL = get_secret(
+    "APP_URL",
+    "http://localhost:8501",
+).rstrip("/")
+
+# Live payments intentionally remain disabled.
+LIVE_PAYMENTS_ENABLED = False
 
 if PAYPAL_MODE not in ("sandbox", "live"):
     PAYPAL_MODE = "sandbox"
-
-# Deliberately disable live payments in this prototype.
-LIVE_PAYMENTS_ENABLED = False
 
 PAYPAL_BASE = (
     "https://api-m.sandbox.paypal.com"
@@ -54,12 +65,15 @@ PAYPAL_BASE = (
     else "https://api-m.paypal.com"
 )
 
+MAX_PAYMENT = Decimal("10000")
+MAX_SHOPPING_BUDGET = Decimal("100000")
+
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-defaults = {
+DEFAULTS = {
     "navigation": "Overview",
     "budget": {
         "income": 3000.0,
@@ -70,6 +84,9 @@ defaults = {
     "active_list_id": None,
     "plan": None,
     "order": None,
+    "order_verified": False,
+    "returned_order_id": None,
+    "order_already_completed": False,
     "activity": [
         {
             "id": "SAMPLE-1001",
@@ -88,11 +105,57 @@ defaults = {
     ],
 }
 
-for key, value in defaults.items():
+for key, value in DEFAULTS.items():
     if key not in st.session_state:
-        st.session_state[key] = value.copy() if isinstance(value, dict) else (
-            list(value) if isinstance(value, list) else value
-        )
+        st.session_state[key] = copy.deepcopy(value)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def money(value):
+    """Format a number as USD."""
+    return f"${float(value):,.2f}"
+
+
+def navigate_to(page):
+    """Update navigation through a widget callback."""
+    st.session_state.navigation = page
+
+
+def calculate_budget(budget):
+    income = Decimal(str(budget["income"]))
+    bills = Decimal(str(budget["bills"]))
+    savings = Decimal(str(budget["savings"]))
+
+    return {
+        "income": float(income),
+        "bills": float(bills),
+        "savings": float(savings),
+        "available": float(income - bills - savings),
+    }
+
+
+def get_json_response(response, label):
+    """Parse a JSON API response with a useful error message."""
+    try:
+        return response.json()
+    except (ValueError, requests.exceptions.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"{label} returned an invalid response."
+        ) from exc
+
+
+def navigate_button(label, page, key, primary=False):
+    st.button(
+        label,
+        key=key,
+        type="primary" if primary else "secondary",
+        on_click=navigate_to,
+        args=(page,),
+        use_container_width=True,
+    )
 
 
 # ============================================================
@@ -103,88 +166,135 @@ def get_groq_client():
     if not GROQ_API_KEY:
         raise ValueError(
             "Groq API key is missing. Add GROQ_API_KEY to "
-            ".streamlit/secrets.toml."
+            ".streamlit/secrets.toml or your environment variables."
         )
+
     return Groq(api_key=GROQ_API_KEY)
 
 
-def make_payment_plan(text):
+def groq_json(system_prompt, user_prompt, temperature=0):
+    """Request structured JSON from Groq."""
     client = get_groq_client()
 
     response = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Extract a proposed payment request. Return JSON with "
-                    "recipient (string), amount (number or null), and "
-                    "purpose (string). Never execute payments. Never invent "
-                    "missing details. The amount must be positive. If the "
-                    "request is ambiguous, explain that details are missing "
-                    "rather than making up an amount or recipient."
-                ),
-            },
-            {"role": "user", "content": text},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
-        temperature=0,
+        temperature=temperature,
     )
 
-    data = json.loads(response.choices[0].message.content)
+    content = response.choices[0].message.content
+
+    if not content:
+        raise ValueError("The AI returned an empty response.")
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "The AI returned invalid JSON. Please try again."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("The AI returned an unexpected data format.")
+
+    return data
+
+
+def make_payment_plan(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Please describe your payment.")
+
+    if len(text) > 2000:
+        raise ValueError(
+            "Please keep the payment description under 2,000 characters."
+        )
+
+    data = groq_json(
+        system_prompt=(
+            "Extract a proposed merchant checkout request. Return a JSON "
+            "object containing recipient (string), amount (number), and "
+            "purpose (string). Never execute payments. Never invent "
+            "missing details. The amount must be positive. If details are "
+            "missing or ambiguous, return an empty recipient or null amount."
+        ),
+        user_prompt=text,
+    )
 
     recipient = str(data.get("recipient") or "").strip()
     purpose = str(data.get("purpose") or "General payment").strip()
 
     if not recipient or len(recipient) > 80:
-        raise ValueError("Please specify a valid payment recipient.")
+        raise ValueError(
+            "Please specify a valid payment recipient or merchant."
+        )
 
     try:
         amount = Decimal(str(data.get("amount")))
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("Please include a clear payment amount.")
 
-    if not amount.is_finite() or not Decimal("0") < amount <= Decimal("10000"):
+    if (
+        not amount.is_finite()
+        or amount <= 0
+        or amount > MAX_PAYMENT
+    ):
         raise ValueError("Enter an amount between $0.01 and $10,000.")
+
+    amount = amount.quantize(Decimal("0.01"))
+
+    if amount <= 0:
+        raise ValueError("The payment must be at least $0.01.")
 
     return {
         "recipient": recipient,
-        "amount": float(amount.quantize(Decimal("0.01"))),
-        "purpose": purpose[:120],
+        "amount": float(amount),
+        "purpose": purpose[:120] or "General payment",
     }
 
 
 def generate_shopping_list(request_text, budget_limit):
-    client = get_groq_client()
+    if not isinstance(request_text, str) or not request_text.strip():
+        raise ValueError("Please describe what you need.")
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are PayPilot's practical shopping assistant. "
-                    "Return JSON with an items array. Each item must contain "
-                    "name (string), category (string), quantity (string), "
-                    "and estimated_price (number in USD). Generate up to "
-                    "25 items. Prices are estimates, not live retailer "
-                    "prices. Aim to stay within budget when practical. "
-                    "Never claim to have checked live prices."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps({
-                    "request": request_text,
-                    "budget_usd": round(float(budget_limit), 2),
-                }),
-            },
-        ],
-        response_format={"type": "json_object"},
+    if len(request_text) > 2000:
+        raise ValueError(
+            "Please keep the shopping request under 2,000 characters."
+        )
+
+    try:
+        budget = Decimal(str(budget_limit))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("Enter a valid shopping budget.")
+
+    if (
+        not budget.is_finite()
+        or budget <= 0
+        or budget > MAX_SHOPPING_BUDGET
+    ):
+        raise ValueError(
+            "The budget must be between $0.01 and $100,000."
+        )
+
+    data = groq_json(
+        system_prompt=(
+            "You are a practical shopping assistant. Return a JSON object "
+            "with an items array. Each item must contain name (string), "
+            "category (string), quantity (string), and estimated_price "
+            "(number in USD). Generate no more than 25 items. Prices are "
+            "estimates, not live retailer prices. Aim to stay within the "
+            "budget when practical. Do not claim to have checked live prices."
+        ),
+        user_prompt=json.dumps({
+            "request": request_text.strip(),
+            "budget_usd": round(float(budget), 2),
+        }),
         temperature=0.3,
     )
 
-    data = json.loads(response.choices[0].message.content)
     raw_items = data.get("items", [])
 
     if not isinstance(raw_items, list):
@@ -209,15 +319,15 @@ def generate_shopping_list(request_text, budget_limit):
             not name
             or not price.is_finite()
             or price < 0
-            or price > Decimal("100000")
+            or price > MAX_SHOPPING_BUDGET
         ):
             continue
 
         items.append({
             "id": uuid.uuid4().hex[:10],
             "name": name,
-            "category": category,
-            "quantity": quantity,
+            "category": category or "Other",
+            "quantity": quantity or "1",
             "estimated_price": float(price.quantize(Decimal("0.01"))),
             "purchased": False,
         })
@@ -230,28 +340,31 @@ def generate_shopping_list(request_text, budget_limit):
     return items
 
 
-def generate_budget_insights(budget, lists):
-    client = get_groq_client()
-
-    totals = calculate_budget(budget)
-
+def generate_budget_insights(budget, shopping_lists):
     shopping_summary = []
-    for entry in lists:
+
+    for entry in shopping_lists:
         shopping_summary.append({
             "request": entry["request"],
             "budget": entry["budget"],
             "estimated_total": round(
-                sum(i["estimated_price"] for i in entry["items"]), 2
+                sum(
+                    item["estimated_price"]
+                    for item in entry["items"]
+                ),
+                2,
             ),
             "checked_off_total": round(
                 sum(
-                    i["estimated_price"]
-                    for i in entry["items"]
-                    if i["purchased"]
+                    item["estimated_price"]
+                    for item in entry["items"]
+                    if item["purchased"]
                 ),
                 2,
             ),
         })
+
+    client = get_groq_client()
 
     response = client.chat.completions.create(
         model=GROQ_MODEL,
@@ -260,17 +373,17 @@ def generate_budget_insights(budget, lists):
                 "role": "system",
                 "content": (
                     "You are PayPilot, a practical budgeting assistant. "
-                    "Give concise, helpful observations and suggestions. "
-                    "Clearly distinguish user-entered budget values from "
-                    "estimated shopping costs. Do not claim to have access "
-                    "to bank accounts, PayPal balances, or actual spending. "
-                    "Do not present estimates as confirmed transactions."
+                    "Give concise, actionable observations and suggestions. "
+                    "Distinguish entered budget values from estimated costs. "
+                    "You do not have access to bank accounts, PayPal balances, "
+                    "or actual spending. Never present estimates as confirmed "
+                    "transactions. Use clear headings and bullet points."
                 ),
             },
             {
                 "role": "user",
                 "content": json.dumps({
-                    "budget": totals,
+                    "budget": calculate_budget(budget),
                     "shopping_lists": shopping_summary,
                 }),
             },
@@ -278,236 +391,287 @@ def generate_budget_insights(budget, lists):
         temperature=0.3,
     )
 
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+
+    if not content:
+        raise ValueError("The AI returned an empty response.")
+
+    return content
 
 
 # ============================================================
-# BUDGET CALCULATIONS
-# ============================================================
-
-def calculate_budget(budget):
-    income = Decimal(str(budget["income"]))
-    bills = Decimal(str(budget["bills"]))
-    savings = Decimal(str(budget["savings"]))
-
-    return {
-        "income": float(income),
-        "bills": float(bills),
-        "savings": float(savings),
-        "available": float(income - bills - savings),
-    }
-
-
-# ============================================================
-# PAYPAL CHECKOUT API
+# PAYPAL API
 # ============================================================
 
 def paypal_access_token():
-    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+    if PAYPAL_MODE == "live" and not LIVE_PAYMENTS_ENABLED:
         raise ValueError(
-            "Add PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET "
-            "to .streamlit/secrets.toml."
+            "Live payments are disabled. Set PAYPAL_MODE to sandbox."
         )
 
-    response = requests.post(
-        f"{PAYPAL_BASE}/v1/oauth2/token",
-        auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
-        headers={"Accept": "application/json"},
-        data={"grant_type": "client_credentials"},
-        timeout=25,
-    )
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        raise ValueError(
+            "Add PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET to "
+            ".streamlit/secrets.toml."
+        )
+
+    try:
+        response = requests.post(
+            f"{PAYPAL_BASE}/v1/oauth2/token",
+            auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+            headers={"Accept": "application/json"},
+            data={"grant_type": "client_credentials"},
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "Could not connect to PayPal. Check your network connection."
+        ) from exc
 
     if not response.ok:
         raise RuntimeError(
             f"PayPal authentication failed (HTTP {response.status_code}). "
-            "Check your credentials and environment."
+            "Check your Sandbox credentials."
         )
 
-    return response.json()["access_token"]
+    data = get_json_response(response, "PayPal authentication")
+    token = data.get("access_token")
+
+    if not token:
+        raise RuntimeError("PayPal did not return an access token.")
+
+    return token
 
 
 def create_paypal_order(amount, description):
-    token = paypal_access_token()
-
     if PAYPAL_MODE == "live" and not LIVE_PAYMENTS_ENABLED:
         raise ValueError("Live payments are disabled in this prototype.")
+
+    amount = Decimal(str(amount))
+
+    if (
+        not amount.is_finite()
+        or amount <= 0
+        or amount > MAX_PAYMENT
+    ):
+        raise ValueError("The checkout amount is invalid.")
+
+    amount = amount.quantize(Decimal("0.01"))
+    token = paypal_access_token()
 
     return_url = f"{APP_URL}/?{urlencode({'paypal_return': '1'})}"
     cancel_url = f"{APP_URL}/?{urlencode({'paypal_cancel': '1'})}"
 
-    response = requests.post(
-        f"{PAYPAL_BASE}/v2/checkout/orders",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
+    payload = {
+        "intent": "CAPTURE",
+        "purchase_units": [
+            {
+                "description": str(description)[:127],
+                "amount": {
+                    "currency_code": "USD",
+                    "value": f"{amount:.2f}",
+                },
+            }
+        ],
+        "application_context": {
+            "brand_name": "PayPilot Demo",
+            "user_action": "PAY_NOW",
+            "return_url": return_url,
+            "cancel_url": cancel_url,
         },
-        json={
-            "intent": "CAPTURE",
-            "purchase_units": [
-                {
-                    "description": description[:127],
-                    "amount": {
-                        "currency_code": "USD",
-                        "value": f"{amount:.2f}",
-                    },
-                }
-            ],
-            "application_context": {
-                "brand_name": "PayPilot Demo",
-                "user_action": "PAY_NOW",
-                "return_url": return_url,
-                "cancel_url": cancel_url,
+    }
+
+    try:
+        response = requests.post(
+            f"{PAYPAL_BASE}/v2/checkout/orders",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
             },
-        },
-        timeout=25,
-    )
+            json=payload,
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "Could not connect to PayPal to create the order."
+        ) from exc
 
     if not response.ok:
         raise RuntimeError(
             f"PayPal order creation failed (HTTP {response.status_code}). "
-            "Check your Sandbox app permissions and credentials."
+            "Check your Sandbox credentials and app permissions."
         )
 
-    order = response.json()
+    order = get_json_response(response, "PayPal order creation")
+
     approval_url = next(
         (
-            link["href"]
+            link.get("href")
             for link in order.get("links", [])
-            if link.get("rel") == "approve"
+            if link.get("rel") == "approve" and link.get("href")
         ),
         None,
     )
 
-    if not approval_url:
-        raise RuntimeError("PayPal did not return an approval URL.")
+    if not order.get("id") or not approval_url:
+        raise RuntimeError(
+            "PayPal did not return a valid order ID and approval URL."
+        )
 
     return {
         "id": order["id"],
         "amount": float(amount),
-        "description": description,
+        "description": str(description)[:127],
         "approval_url": approval_url,
     }
-
-
-def capture_paypal_order(order_id):
-    token = paypal_access_token()
-
-    response = requests.post(
-        f"{PAYPAL_BASE}/v2/checkout/orders/{order_id}/capture",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={},
-        timeout=25,
-    )
-
-    if not response.ok:
-        try:
-            message = response.json().get("message", "Capture failed")
-        except ValueError:
-            message = "Capture failed"
-        raise RuntimeError(
-            f"PayPal capture failed (HTTP {response.status_code}): {message}"
-        )
-
-    return response.json()
 
 
 def verify_paypal_order(order_id):
     token = paypal_access_token()
 
-    response = requests.get(
-        f"{PAYPAL_BASE}/v2/checkout/orders/{order_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=25,
-    )
+    try:
+        response = requests.get(
+            f"{PAYPAL_BASE}/v2/checkout/orders/{order_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError("Could not connect to PayPal to verify the order.") from exc
 
     if not response.ok:
-        raise RuntimeError("Could not verify the PayPal order status.")
+        raise RuntimeError(
+            f"PayPal order verification failed (HTTP {response.status_code})."
+        )
 
-    return response.json()
+    return get_json_response(response, "PayPal order verification")
+
+
+def capture_paypal_order(order_id):
+    token = paypal_access_token()
+
+    try:
+        response = requests.post(
+            f"{PAYPAL_BASE}/v2/checkout/orders/{order_id}/capture",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={},
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "Could not connect to PayPal to capture the order."
+        ) from exc
+
+    if not response.ok:
+        try:
+            message = response.json().get("message", "Capture failed")
+        except (ValueError, AttributeError):
+            message = "Capture failed"
+
+        raise RuntimeError(
+            f"PayPal capture failed (HTTP {response.status_code}): {message}"
+        )
+
+    return get_json_response(response, "PayPal capture")
 
 
 # ============================================================
 # STYLING
 # ============================================================
 
-st.markdown("""
-<style>
-.stApp {
-    background: #0b1020;
-    color: #edf2ff;
-}
-[data-testid="stSidebar"] {
-    background: #11182b;
-    border-right: 1px solid #25334f;
-}
-[data-testid="stMetric"] {
-    background: #151e33;
-    border: 1px solid #293652;
-    border-radius: 14px;
-    padding: 15px;
-}
-.hero {
-    background: linear-gradient(120deg,#182c53,#172044 60%,#291b4b);
-    border: 1px solid #33466e;
-    border-radius: 20px;
-    padding: 26px;
-    margin-bottom: 22px;
-}
-.eyebrow {
-    color: #91a8ff;
-    letter-spacing: 2px;
-    font-size: 11px;
-    font-weight: 700;
-}
-.muted {
-    color: #a9b6d0;
-}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: #0b1020;
+        color: #edf2ff;
+    }
+
+    [data-testid="stSidebar"] {
+        background: #11182b;
+        border-right: 1px solid #25334f;
+    }
+
+    [data-testid="stMetric"] {
+        background: #151e33;
+        border: 1px solid #293652;
+        border-radius: 14px;
+        padding: 15px;
+    }
+
+    .hero {
+        background: linear-gradient(
+            120deg, #182c53, #172044 60%, #291b4b
+        );
+        border: 1px solid #33466e;
+        border-radius: 20px;
+        padding: 26px;
+        margin-bottom: 22px;
+    }
+
+    .eyebrow {
+        color: #91a8ff;
+        letter-spacing: 2px;
+        font-size: 11px;
+        font-weight: 700;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
 # PAYPAL REDIRECT HANDLING
 # ============================================================
 
-query_params = st.query_params
-
-if query_params.get("paypal_cancel") == "1":
-    st.warning("Checkout cancelled. No capture was requested.")
-    st.query_params.clear()
-
-if query_params.get("paypal_return") == "1":
-    returned_id = query_params.get("token", "")
-    current_order = st.session_state.order
-
-    if current_order and returned_id == current_order["id"]:
-        try:
-            verified = verify_paypal_order(returned_id)
-
-            if verified.get("status") == "APPROVED":
-                st.session_state.returned_order_id = returned_id
-                st.session_state.order_verified = True
-            elif verified.get("status") == "COMPLETED":
-                st.session_state.returned_order_id = returned_id
-                st.session_state.order_verified = True
-                st.session_state.order_already_completed = True
-            else:
-                st.session_state.order_verified = False
-                st.warning(
-                    f"PayPal reports order status: {verified.get('status')}."
-                )
-        except Exception as exc:
-            st.session_state.order_verified = False
-            st.error(f"Could not verify returned order: {exc}")
-    else:
+try:
+    if st.query_params.get("paypal_cancel") == "1":
         st.session_state.order_verified = False
-        st.error(
-            "The returned order does not match the current browser session. "
-            "Create a new sandbox checkout."
-        )
+        st.session_state.returned_order_id = None
+        st.warning("Checkout cancelled. No capture was requested.")
+        st.query_params.clear()
+
+    elif st.query_params.get("paypal_return") == "1":
+        returned_id = st.query_params.get("token", "")
+        current_order = st.session_state.order
+
+        # Clear the redirect parameters to avoid processing them
+        # repeatedly on subsequent Streamlit reruns.
+        st.query_params.clear()
+
+        if current_order and returned_id == current_order.get("id"):
+            try:
+                verified_order = verify_paypal_order(returned_id)
+                status = verified_order.get("status")
+
+                if status in ("APPROVED", "COMPLETED"):
+                    st.session_state.returned_order_id = returned_id
+                    st.session_state.order_verified = True
+                    st.session_state.order_already_completed = (
+                        status == "COMPLETED"
+                    )
+                else:
+                    st.session_state.order_verified = False
+                    st.warning(
+                        f"PayPal reports order status: {status or 'UNKNOWN'}."
+                    )
+
+            except Exception as exc:
+                st.session_state.order_verified = False
+                st.error(f"Could not verify the returned order: {exc}")
+
+        else:
+            st.session_state.order_verified = False
+            st.error(
+                "The returned order does not match the current session. "
+                "Create a new sandbox checkout."
+            )
+
+except Exception as exc:
+    st.error(f"Could not process the PayPal redirect: {exc}")
 
 
 # ============================================================
@@ -532,12 +696,14 @@ with st.sidebar:
         "WORKSPACE",
         PAGES,
         key="navigation",
-        on_change=lambda: None,
     )
 
     st.divider()
-    st.caption(f"Groq AI: {'Configured' if GROQ_API_KEY else 'Not configured'}")
-    st.caption(f"PayPal: {PAYPAL_MODE.upper()}")
+
+    st.caption(
+        f"Groq AI: {'Configured' if GROQ_API_KEY else 'Not configured'}"
+    )
+    st.caption(f"PayPal environment: {PAYPAL_MODE.upper()}")
     st.caption("Personal wallet connection: Not implemented")
     st.caption("Budget data: Current session only")
 
@@ -549,13 +715,16 @@ page = st.session_state.navigation
 # HEADER
 # ============================================================
 
-st.markdown("""
-<div class="hero">
-    <div class="eyebrow">AI · PAYMENTS · HUMAN CONTROL</div>
-    <h1>PayPilot — Your AI Money Agent</h1>
-    <p>Plan your money. Build better habits. Review every payment.</p>
-</div>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <div class="hero">
+        <div class="eyebrow">AI · PAYMENTS · HUMAN CONTROL</div>
+        <h1>PayPilot — Your AI Money Agent</h1>
+        <p>Plan your money. Build better habits. Review every payment.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
@@ -579,9 +748,9 @@ if page == "Overview":
     )
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Available to plan", f"${budget['available']:,.2f}")
+    c1.metric("Available to plan", money(budget["available"]))
     c2.metric("Shopping lists", len(lists))
-    c3.metric("Shopping estimates", f"${shopping_estimate:,.2f}")
+    c3.metric("Shopping estimates", money(shopping_estimate))
 
     st.markdown("### What would you like to do?")
 
@@ -590,33 +759,41 @@ if page == "Overview":
     with col1:
         st.markdown("#### 🤖 AI Assistant")
         st.write("Turn a natural-language request into a payment plan.")
-        if st.button("Create payment plan →", key="home_payment", type="primary"):
-            st.session_state.navigation = "AI Assistant"
-            st.rerun()
+        navigate_button(
+            "Create payment plan →",
+            "AI Assistant",
+            "home_payment",
+            primary=True,
+        )
 
     with col2:
         st.markdown("#### 💰 Budget & Lists")
         st.write("Plan monthly spending and create shopping lists.")
-        if st.button("Open Budget & Lists →", key="home_budget"):
-            st.session_state.navigation = "Budget & Lists"
-            st.rerun()
+        navigate_button(
+            "Open Budget & Lists →",
+            "Budget & Lists",
+            "home_budget",
+        )
 
     with col3:
         st.markdown("#### 🔗 PayPal Checkout")
         st.write("Review and approve a sandbox checkout.")
-        if st.button("Open PayPal Checkout →", key="home_checkout"):
-            st.session_state.navigation = "PayPal Checkout"
-            st.rerun()
+        navigate_button(
+            "Open PayPal Checkout →",
+            "PayPal Checkout",
+            "home_checkout",
+        )
 
     st.markdown("### Monthly allocation")
 
     if budget["available"] < 0:
         st.error(
-            f"Your bills and savings goal exceed your income by "
-            f"${abs(budget['available']):,.2f}."
+            "Your bills and savings goal exceed your income by "
+            f"{money(abs(budget['available']))}."
         )
     elif budget["income"] > 0:
         allocated = budget["income"] - budget["available"]
+
         st.progress(
             min(1.0, max(0.0, allocated / budget["income"])),
             text="Income allocated to bills and savings",
@@ -634,15 +811,19 @@ if page == "Overview":
 
 elif page == "AI Assistant":
     st.subheader("🤖 AI Payment Planner")
+
     st.write(
-        "Describe a payment. PayPilot extracts the details for you to review."
+        "Describe a proposed payment. Review the extracted details "
+        "before creating a PayPal checkout."
     )
 
     with st.form("payment_form"):
         request_text = st.text_area(
             "Describe your payment",
             placeholder="Prepare a $35 checkout for a design consultation",
+            max_chars=2000,
         )
+
         submit_plan = st.form_submit_button(
             "Create payment plan",
             type="primary",
@@ -650,8 +831,17 @@ elif page == "AI Assistant":
 
     if submit_plan:
         try:
-            st.session_state.plan = make_payment_plan(request_text)
+            with st.spinner("Preparing your payment plan..."):
+                st.session_state.plan = make_payment_plan(request_text)
+
+            # A changed plan must not inherit the previous checkout.
+            st.session_state.order = None
+            st.session_state.order_verified = False
+            st.session_state.returned_order_id = None
+            st.session_state.order_already_completed = False
+
             st.success("Payment plan prepared.")
+
         except Exception as exc:
             st.error(f"Could not prepare payment plan: {exc}")
 
@@ -661,42 +851,48 @@ elif page == "AI Assistant":
         st.markdown("### Review payment details")
 
         c1, c2 = st.columns(2)
-        c1.metric("Amount", f"${plan['amount']:,.2f} USD")
-        c2.write(f"**Recipient / description**\n\n{plan['recipient']}")
+        c1.metric("Amount", f"{money(plan['amount'])} USD")
+        c2.write(f"**Recipient / merchant**\n\n{plan['recipient']}")
 
         st.write(f"**Purpose:** {plan['purpose']}")
 
         st.info(
             "Creating this plan does not move money. The PayPal integration "
-            "below creates a merchant checkout order, not a personal "
+            "creates a merchant checkout order, not a personal "
             "person-to-person transfer."
         )
 
         if st.button(
             "Create PayPal sandbox checkout →",
             type="primary",
+            key="create_paypal_checkout",
         ):
             try:
-                order = create_paypal_order(
-                    plan["amount"],
-                    f"{plan['recipient']} — {plan['purpose']}",
-                )
+                with st.spinner("Creating PayPal order..."):
+                    order = create_paypal_order(
+                        plan["amount"],
+                        f"{plan['recipient']} — {plan['purpose']}",
+                    )
+
                 st.session_state.order = order
                 st.session_state.order_verified = False
                 st.session_state.returned_order_id = None
                 st.session_state.order_already_completed = False
+
                 st.session_state.navigation = "PayPal Checkout"
                 st.rerun()
+
             except Exception as exc:
                 st.error(f"Could not create PayPal order: {exc}")
 
 
 # ============================================================
-# BUDGET & LISTS
+# BUDGET & SHOPPING LISTS
 # ============================================================
 
 elif page == "Budget & Lists":
     st.subheader("💰 Smart Budget & Lists")
+
     st.caption(
         "Manage your monthly budget and generate shopping lists with Groq."
     )
@@ -705,12 +901,13 @@ elif page == "Budget & Lists":
 
     with st.form("budget_form"):
         st.markdown("### Your monthly budget")
+
         c1, c2, c3 = st.columns(3)
 
         income = c1.number_input(
             "Monthly take-home income ($)",
             min_value=0.0,
-            max_value=10000000.0,
+            max_value=10_000_000.0,
             value=float(budget["income"]),
             step=100.0,
         )
@@ -718,7 +915,7 @@ elif page == "Budget & Lists":
         bills = c2.number_input(
             "Monthly bills ($)",
             min_value=0.0,
-            max_value=10000000.0,
+            max_value=10_000_000.0,
             value=float(budget["bills"]),
             step=50.0,
         )
@@ -726,7 +923,7 @@ elif page == "Budget & Lists":
         savings = c3.number_input(
             "Monthly savings goal ($)",
             min_value=0.0,
-            max_value=10000000.0,
+            max_value=10_000_000.0,
             value=float(budget["savings"]),
             step=50.0,
         )
@@ -747,10 +944,10 @@ elif page == "Budget & Lists":
     totals = calculate_budget(st.session_state.budget)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Income", f"${totals['income']:,.2f}")
-    c2.metric("Bills", f"${totals['bills']:,.2f}")
-    c3.metric("Savings", f"${totals['savings']:,.2f}")
-    c4.metric("Available", f"${totals['available']:,.2f}")
+    c1.metric("Income", money(totals["income"]))
+    c2.metric("Bills", money(totals["bills"]))
+    c3.metric("Savings", money(totals["savings"]))
+    c4.metric("Available", money(totals["available"]))
 
     if totals["available"] < 0:
         st.error(
@@ -759,6 +956,7 @@ elif page == "Budget & Lists":
         )
     elif totals["income"] > 0:
         allocated = totals["income"] - totals["available"]
+
         st.progress(
             min(1.0, max(0.0, allocated / totals["income"])),
             text="Income allocated",
@@ -774,15 +972,19 @@ elif page == "Budget & Lists":
                 "Groceries for one person for 7 days, including meals, "
                 "fruit, snacks, and household essentials."
             ),
+            max_chars=2000,
         )
 
-        default_limit = max(0.0, min(100.0, totals["available"]))
+        default_limit = max(
+            0.01,
+            min(100.0, totals["available"]),
+        )
 
         shopping_budget = st.number_input(
             "Shopping budget ($)",
             min_value=0.01,
             max_value=100000.0,
-            value=max(0.01, float(default_limit)),
+            value=float(default_limit),
             step=5.0,
         )
 
@@ -811,6 +1013,7 @@ elif page == "Budget & Lists":
 
                 st.session_state.shopping_lists.insert(0, new_list)
                 st.session_state.active_list_id = new_list["id"]
+
                 st.success("Shopping list created.")
                 st.rerun()
 
@@ -824,16 +1027,23 @@ elif page == "Budget & Lists":
 
     if not lists:
         st.info("You haven't created a shopping list yet.")
+
     else:
+        # Include an ID in each label so duplicate requests are distinguishable.
         options = {
-            f"{entry['request'][:45]} — ${entry['budget']:.2f}": entry["id"]
+            (
+                f"{entry['request'][:40]} — "
+                f"{money(entry['budget'])} [{entry['id']}]"
+            ): entry["id"]
             for entry in lists
         }
 
         labels = list(options.keys())
+
         default_label = next(
             (
-                label for label, list_id in options.items()
+                label
+                for label, list_id in options.items()
                 if list_id == st.session_state.active_list_id
             ),
             labels[0],
@@ -849,14 +1059,19 @@ elif page == "Budget & Lists":
         selected_id = options[selected_label]
 
         current_list = next(
-            entry for entry in lists if entry["id"] == selected_id
+            entry for entry in lists
+            if entry["id"] == selected_id
         )
+
+        st.session_state.active_list_id = selected_id
 
         items = current_list["items"]
 
         estimated_total = round(
-            sum(item["estimated_price"] for item in items), 2
+            sum(item["estimated_price"] for item in items),
+            2,
         )
+
         checked_total = round(
             sum(
                 item["estimated_price"]
@@ -869,18 +1084,19 @@ elif page == "Budget & Lists":
         remaining = current_list["budget"] - checked_total
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Estimated list total", f"${estimated_total:.2f}")
-        c2.metric("Checked-off total", f"${checked_total:.2f}")
-        c3.metric("Budget remaining", f"${remaining:.2f}")
+        c1.metric("Estimated list total", money(estimated_total))
+        c2.metric("Checked-off total", money(checked_total))
+        c3.metric("Budget remaining", money(remaining))
 
         if estimated_total > current_list["budget"]:
             st.warning(
-                f"List exceeds its budget by "
-                f"${estimated_total - current_list['budget']:.2f}."
+                "List exceeds its budget by "
+                f"{money(estimated_total - current_list['budget'])}."
             )
         else:
             st.success(
-                f"List is ${current_list['budget'] - estimated_total:.2f} "
+                f"List is "
+                f"{money(current_list['budget'] - estimated_total)} "
                 "under budget."
             )
 
@@ -892,7 +1108,9 @@ elif page == "Budget & Lists":
             st.progress(progress, text="Shopping progress")
 
             for item in items:
-                checkbox_key = f"buy_{current_list['id']}_{item['id']}"
+                checkbox_key = (
+                    f"buy_{current_list['id']}_{item['id']}"
+                )
 
                 if checkbox_key not in st.session_state:
                     st.session_state[checkbox_key] = item["purchased"]
@@ -914,7 +1132,9 @@ elif page == "Budget & Lists":
                     unsafe_allow_html=True,
                 )
 
-                right.markdown(f"**${item['estimated_price']:.2f}**")
+                right.markdown(
+                    f"**{money(item['estimated_price'])}**"
+                )
 
         st.download_button(
             "Download shopping list JSON",
@@ -923,15 +1143,23 @@ elif page == "Budget & Lists":
             mime="application/json",
         )
 
-        if st.button("Delete selected list"):
+        if st.button("Delete selected list", key="delete_shopping_list"):
             st.session_state.shopping_lists = [
-                entry for entry in lists if entry["id"] != selected_id
+                entry for entry in st.session_state.shopping_lists
+                if entry["id"] != selected_id
             ]
+
             st.session_state.active_list_id = (
                 st.session_state.shopping_lists[0]["id"]
                 if st.session_state.shopping_lists
                 else None
             )
+
+            # Remove the old selector state so the next run uses
+            # the remaining lists.
+            if "shopping_list_selector" in st.session_state:
+                del st.session_state["shopping_list_selector"]
+
             st.rerun()
 
     st.caption(
@@ -956,41 +1184,53 @@ elif page == "PayPal Checkout":
 
     if not order:
         st.info("Create a payment plan first in AI Assistant.")
+
     else:
         st.write(f"**Order ID:** `{order['id']}`")
         st.write(f"**Description:** {order['description']}")
-        st.metric("Order amount", f"${order['amount']:.2f} USD")
+        st.metric("Order amount", f"{money(order['amount'])} USD")
 
         st.link_button(
             "Open PayPal approval page",
             order["approval_url"],
         )
 
-        returned_id = st.session_state.get("returned_order_id")
-        verified = st.session_state.get("order_verified", False)
+        returned_id = st.session_state.returned_order_id
+        verified = st.session_state.order_verified
 
         if returned_id == order["id"] and verified:
-            if st.session_state.get("order_already_completed"):
-                st.success("PayPal reports this order is already completed.")
+
+            if st.session_state.order_already_completed:
+                st.success(
+                    "PayPal reports this order is already completed."
+                )
+
             else:
                 st.success("The returned order was verified with PayPal.")
 
                 consent = st.checkbox(
-                    "I have reviewed this sandbox order and want to request capture."
+                    "I reviewed this sandbox order and want to request capture.",
+                    key=f"capture_consent_{order['id']}",
                 )
 
                 if st.button(
                     "Confirm and capture sandbox payment",
                     type="primary",
+                    key=f"capture_order_{order['id']}",
                 ):
                     if not consent:
                         st.error("Confirm the checkbox before capturing.")
+
                     else:
                         try:
-                            result = capture_paypal_order(order["id"])
+                            with st.spinner("Requesting PayPal capture..."):
+                                result = capture_paypal_order(order["id"])
+
                             status = result.get("status", "UNKNOWN")
 
-                            st.write(f"PayPal capture status: **{status}**")
+                            st.write(
+                                f"PayPal capture status: **{status}**"
+                            )
 
                             if status == "COMPLETED":
                                 already_recorded = any(
@@ -1005,14 +1245,20 @@ elif page == "PayPal Checkout":
                                             "id": order["id"],
                                             "recipient": order["description"],
                                             "amount": order["amount"],
-                                            "purpose": "PayPal sandbox checkout",
-                                            "status": "Completed sandbox capture",
+                                            "purpose": (
+                                                "PayPal sandbox checkout"
+                                            ),
+                                            "status": (
+                                                "Completed sandbox capture"
+                                            ),
                                         },
                                     )
 
+                                st.session_state.order_already_completed = True
                                 st.success(
                                     "PayPal confirmed the sandbox capture."
                                 )
+
                             else:
                                 st.warning(
                                     "The order is not marked completed. "
@@ -1021,6 +1267,7 @@ elif page == "PayPal Checkout":
 
                         except Exception as exc:
                             st.error(f"Capture failed: {exc}")
+
         else:
             st.info(
                 "Approve the order on PayPal, then return to this app. "
@@ -1034,16 +1281,17 @@ elif page == "PayPal Checkout":
 
 elif page == "AI Insights":
     st.subheader("📊 AI Budget Insights")
+
     st.caption(
-        "Insights use your entered budget and the shopping lists in this session."
+        "Insights use your entered budget and shopping lists in this session."
     )
 
     totals = calculate_budget(st.session_state.budget)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Income", f"${totals['income']:,.2f}")
-    c2.metric("Bills", f"${totals['bills']:,.2f}")
-    c3.metric("Available", f"${totals['available']:,.2f}")
+    c1.metric("Income", money(totals["income"]))
+    c2.metric("Bills", money(totals["bills"]))
+    c3.metric("Available", money(totals["available"]))
 
     if st.button("Generate AI insights", type="primary"):
         try:
@@ -1052,7 +1300,9 @@ elif page == "AI Insights":
                     st.session_state.budget,
                     st.session_state.shopping_lists,
                 )
+
             st.markdown(insights)
+
         except Exception as exc:
             st.error(f"Could not generate insights: {exc}")
 
@@ -1068,6 +1318,7 @@ elif page == "AI Insights":
 
 elif page == "Activity":
     st.subheader("📋 Activity History")
+
     st.caption(
         "Local app records only. This is not a full PayPal account statement."
     )
@@ -1087,6 +1338,7 @@ elif page == "Activity":
             file_name="paypilot-activity.json",
             mime="application/json",
         )
+
     else:
         st.info("No activity records yet.")
 
@@ -1096,6 +1348,7 @@ elif page == "Activity":
 # ============================================================
 
 st.divider()
+
 st.caption(
     "PayPilot MVP · Groq AI · PayPal REST API · Sandbox checkout · "
     "Session-based budgeting · No personal wallet connection"
